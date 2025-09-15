@@ -16,6 +16,8 @@ on:
       - master
       - '*.x'
       - a11y
+  workflow_dispatch: {} # This adds a manual "Run workflow" button
+
 
 permissions:
   contents: read

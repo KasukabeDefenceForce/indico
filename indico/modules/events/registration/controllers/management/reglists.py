@@ -22,11 +22,9 @@ from werkzeug.exceptions import BadRequest, Forbidden, NotFound
 
 from indico.core import signals
 from indico.core.cache import make_scoped_cache
-from indico.core.config import config
 from indico.core.db import db
 from indico.core.errors import IndicoError, NoReportError
 from indico.core.notifications import make_email, send_email
-from indico.legacy.pdfinterface.conference import RegistrantsListToBookPDF, RegistrantsListToPDF
 from indico.modules.categories.models.categories import Category
 from indico.modules.designer import PageLayout, TemplateType
 from indico.modules.designer.models.templates import DesignerTemplate
@@ -57,13 +55,14 @@ from indico.modules.events.registration.util import (ActionMenuEntry, create_reg
                                                      get_flat_section_submission_data, get_initial_form_values,
                                                      get_ticket_attachments, get_title_uuid, get_user_data,
                                                      import_registrations_from_csv, load_registration_schema,
-                                                     make_registration_schema)
+                                                     make_registration_schema, prepare_participant_list_data)
 from indico.modules.events.registration.views import WPManageRegistration
+from indico.modules.events.timetable.util import create_pdf
 from indico.modules.events.util import ZipGeneratorMixin
 from indico.modules.logs import LogKind
 from indico.modules.logs.util import make_diff_log
 from indico.modules.receipts.models.files import ReceiptFile
-from indico.util.date_time import format_currency, now_utc, relativedelta
+from indico.util.date_time import format_currency, format_date, now_utc, relativedelta
 from indico.util.fs import secure_filename
 from indico.util.i18n import _, ngettext
 from indico.util.marshmallow import Principal
@@ -74,6 +73,7 @@ from indico.web.args import use_kwargs
 from indico.web.flask.templating import get_template_module
 from indico.web.flask.util import send_file, url_for
 from indico.web.forms.base import FormDefaults
+from indico.web.rh import RH
 from indico.web.util import jsonify_data, jsonify_form, jsonify_template
 
 
@@ -451,29 +451,51 @@ class RHRegistrationsExportBase(RHRegistrationsActionBase):
         self.export_config = self.list_generator.get_list_export_config()
 
 
-class RHRegistrationsExportPDFTable(RHRegistrationsExportBase):
-    """Export registration list to a PDF in table style."""
+class RHRegistrationsExportPDF(RHRegistrationsExportBase):
+    """Export registration list to a PDF in table or book style."""
+
+    _base_spec = getattr(RHRegistrationsExportBase, 'normalize_url_spec', RH.normalize_url_spec)
+
+    normalize_url_spec = {
+        **_base_spec,
+        'preserved_args': (_base_spec.get('preserved_args', set()) | {'export_type'})
+    }
+
+    def _process_args(self):
+        super()._process_args()
+        self.export_type = request.view_args.get('export_type')
 
     def _process(self):
-        pdf = RegistrantsListToPDF(self.event, reglist=self.registrations, display=self.export_config['regform_items'],
-                                   static_items=self.export_config['static_item_ids'])
-        try:
-            data = pdf.getPDFBin()
-        except Exception:
-            if config.DEBUG:
-                raise
-            raise NoReportError(_('Text too large to generate a PDF with table style. '
-                                  'Please try again generating with book style.'))
-        return send_file('RegistrantsList.pdf', BytesIO(data), 'application/pdf')
+        primary_headers, dynamic_headers, static_headers, rows = prepare_participant_list_data(
+            reglist=self.registrations,
+            display=self.export_config['regform_items'],
+            static_items=self.export_config['static_item_ids'],
+        )
+        generation_date = format_date(now_utc(), format='full', timezone=self.event.tzinfo)
+        if self.export_type not in ('table', 'book'):
+            raise BadRequest('Invalid export type')
 
+        if self.export_type == 'table':
+            css_path = 'events/registration/pdf/participants_table.css'
+            template_path = 'events/registration/pdf/participants_table.html'
+            filename = 'RegistrantsList'
+        else:  # book
+            css_path = 'events/registration/pdf/participants_book.css'
+            template_path = 'events/registration/pdf/participants_book.html'
+            filename = 'RegistrantsBook'
 
-class RHRegistrationsExportPDFBook(RHRegistrationsExportBase):
-    """Export registration list to a PDF in book style."""
-
-    def _process(self):
-        static_item_ids, item_ids, _extra_item_ids = self.list_generator.get_item_ids()
-        pdf = RegistrantsListToBookPDF(self.event, self.regform, self.registrations, item_ids, static_item_ids)
-        return send_file('RegistrantsBook.pdf', BytesIO(pdf.getPDFBin()), 'application/pdf')
+        css = render_template(css_path)
+        html = render_template(
+            template_path,
+            event=self.event,
+            primary_headers=primary_headers,
+            dynamic_headers=dynamic_headers,
+            static_headers=static_headers,
+            rows=rows,
+            generation_date=generation_date
+        )
+        pdf = create_pdf(html, css, self.event)
+        return send_file(f'{filename}.pdf', pdf, 'application/pdf')
 
 
 class RHRegistrationsExportCSV(RHRegistrationsExportBase):
